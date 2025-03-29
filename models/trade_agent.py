@@ -1,10 +1,11 @@
+from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from dqn import DQN
 from stock_gym import StockTradeEnv, merge_stocks
-
+import json
 
 class TradingAgent:
     def __init__(self, env, gamma=0.99, lr=0.010):
@@ -14,7 +15,7 @@ class TradingAgent:
         self.epsilon_decay = 0.0975
         self.epsilon_min = 0.250
         self.model = DQN(env.observation_space.shape[0], env.action_space.n)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=3e-6)
         self.criterion = nn.HuberLoss()
 
     def select_action(self, state):
@@ -65,12 +66,15 @@ class TradingAgent:
 
 
 if __name__ == "__main__":
-    env = StockTradeEnv(merge_stocks(), initial_cash=25000)
+    initial_cash = int(input("Enter Initial Balance: "))
+    stocks_nos = int(input("Enter Number Of Stocks To Consider: "))
+    stocks_nos = stocks_nos if stocks_nos < 500 else 50
+    env = StockTradeEnv(merge_stocks(), initial_cash=initial_cash,num_stocks=stocks_nos)
     agent = TradingAgent(env)
-    num_episodes = 5
-    # num_episodes = int(input("Enter Number Of Episodes: "))
+    num_episodes = int(input("Enter Number Of Episodes: "))
     print("Starting Episodic Training")
     best_portfolio = float("-inf")
+    all_ep_portfolios = defaultdict(list)
     for episode in range(num_episodes):
         print(f"\r Current Episode: {episode} / {num_episodes}")
         state, _ = env.reset()
@@ -95,20 +99,22 @@ if __name__ == "__main__":
             state = next_state
             total_reward += reward
             step += 1
-
+            
             # Additional debug info every 10 steps
-            if step % 10 == 0:
-                print(
-                    f"[Episode {episode} | Step {step}] Portfolio Value: {portfolio_value:.2f}"
-                )
-
+            print(
+                f"[Episode {episode} | Step {step}] Portfolio Value: {portfolio_value:.2f}"
+            )
+        all_ep_portfolios[episode] = env.portfolio_values
         final_portfolio_value = env.portfolio_value()
         print(
             f"Episode {episode + 1} completed: Total Reward = {total_reward:.2f} | Final Portfolio Value: {final_portfolio_value:.2f}"
         )
-
         # Save model if this episode achieved the best portfolio value
         if final_portfolio_value > best_portfolio:
             best_portfolio = final_portfolio_value
-            torch.save(agent.model.state_dict(), "best_model.pth")
+            torch.save(agent.model.state_dict(), f"Ep_{episode+1}_Agent.pth")
             print(f"Saved new best model with portfolio value: {best_portfolio:.2f}")
+
+    with open("../stats/Iter_1.json", "w") as fp:
+       json.dump(all_ep_portfolios, fp,indent=4)
+

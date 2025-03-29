@@ -29,10 +29,10 @@ def merge_stocks() -> DataFrame:
 
 class StockTradeEnv(gym.Env):
     def __init__(
-        self, data, initial_cash: float, num_stocks: int = 30
+        self, data, initial_cash: float=50000, num_stocks: int = 300
     ) -> None:
         super(StockTradeEnv, self).__init__()
-
+        self.initial_cash = initial_cash
         self.available_stocks = data
         self.curr_iter = 0
         self.balance = initial_cash
@@ -43,8 +43,7 @@ class StockTradeEnv(gym.Env):
         self.sharpe_ratios = []
         self.treynor_ratios = []
         self.market_returns = []
-
-        self.risk_free_rate = 0.02 / 252
+        self.risk_free_rate = 0.10
         self.num_stocks = num_stocks
         self.selected_tickers = np.random.choice(
             self.available_stocks.index.get_level_values(0).unique(),
@@ -67,13 +66,12 @@ class StockTradeEnv(gym.Env):
         super().reset(seed=seed)
 
         self.curr_iter = 0
-        self.balance = 10000.00
+        self.balance = self.initial_cash 
         self.holdings = defaultdict(int)
         self.portfolio_returns = []
         self.market_returns = []
         self.portfolio_values = []
         self.prev_value = self.balance
-
         self.selected_tickers = np.random.choice(
             self.available_stocks.index.get_level_values(0).unique(),
             size=self.num_stocks,
@@ -109,7 +107,6 @@ class StockTradeEnv(gym.Env):
         if new_value is None:
             print("Warning: portfolio_value() returned None. Setting reward to 0.")
             return self._get_observations(), 0, True, {}
-
         portfolio_return = (new_value - self.prev_value) / (self.prev_value + 1e-6)
         self.prev_value = new_value
 
@@ -158,7 +155,8 @@ class StockTradeEnv(gym.Env):
 
         self.curr_iter += 1
         done = self.curr_iter >= len(self.available_stocks.loc[ticker]) - 1
-
+        if done:
+            print(f"Best Portfolio: {max(self.portfolio_values)}")
         print("=" * 40)
         print(f"\nStep: {self.curr_iter}")
         print(f"Balance: {self.balance}")
