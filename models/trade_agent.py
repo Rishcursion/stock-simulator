@@ -75,6 +75,7 @@ if __name__ == "__main__":
     print("Starting Episodic Training")
     best_portfolio = float("-inf")
     all_ep_portfolios = defaultdict(list)
+    holdings = defaultdict(dict) 
     for episode in range(num_episodes):
         print(f"\r Current Episode: {episode} / {num_episodes}")
         state, _ = env.reset()
@@ -106,6 +107,7 @@ if __name__ == "__main__":
             )
         all_ep_portfolios[episode] = env.portfolio_values
         final_portfolio_value = env.portfolio_value()
+        holdings[episode] = env.holdings
         print(
             f"Episode {episode + 1} completed: Total Reward = {total_reward:.2f} | Final Portfolio Value: {final_portfolio_value:.2f}"
         )
@@ -115,6 +117,7 @@ if __name__ == "__main__":
             torch.save(agent.model.state_dict(), f"Ep_{episode+1}_Agent.pth")
             print(f"Saved new best model with portfolio value: {best_portfolio:.2f}")
 
-    with open("../stats/Iter_1.json", "w") as fp:
+    with open("../stats/Iter_1_values.json", "w") as fp:
        json.dump(all_ep_portfolios, fp,indent=4)
-
+    with open("../stats/Iter_1_holdings.json", "w") as fp:
+        json.dump(holdings, fp, indent=4)

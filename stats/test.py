@@ -1,65 +1,76 @@
 import json
 
-import pandas as pd
+import matplotlib.pyplot as plt
+
+data = json.load(open("Iter_1_values.json", "r"))
+for episode, values in data.items():
+    plt.plot([i for i in range(len(values))], values, label=f"Episode {int(episode)+1}")
+plt.xlabel("Steps In Episode")
+plt.ylabel("Portfolio Value")
+plt.legend()
+plt.title("Performance Of Agent Across Episodes")
+plt.show()
+
+
+data2 = json.load(open("Iter_1_holdings.json", "r"))
+
+
+import plotly.express as px
 import plotly.graph_objects as go
 
-data = json.load(open("Iter_1.json", "r"))
-
-
-def generate_episode_candlestick_data(all_episodes_portfolio_values):
+def plot_holdings_distribution(holdings, top_n=10):
     """
-    Converts step-wise portfolio values into episode-wise candlestick data.
-
+    Plots the distribution of stock holdings using an interactive bar chart and pie chart.
+    
     Args:
-        all_episodes_portfolio_values: List of lists containing portfolio values per episode.
-
-    Returns:
-        DataFrame with columns ['Episode', 'Open', 'High', 'Low', 'Close']
+        holdings (dict): Dictionary with stock tickers as keys and the number of shares as values.
+        top_n (int): Number of top stocks to show individually before grouping the rest into "Others".
     """
-    episodes = []
+    if not holdings:
+        print("No holdings to display.")
+        return
+    
+    # Sort holdings in descending order
+    sorted_holdings = sorted(holdings.items(), key=lambda x: x[1], reverse=True)
+    
+    # Split into top N stocks and others
+    if len(sorted_holdings) > top_n:
+        top_stocks = dict(sorted_holdings[:top_n])
+        other_stocks = sum(shares for _, shares in sorted_holdings[top_n:])
+        top_stocks["Others"] = other_stocks  # Aggregate smaller holdings
+    else:
+        top_stocks = dict(sorted_holdings)
 
-    for episode_num, portfolio_values in all_episodes_portfolio_values.items():
-        if len(portfolio_values) == 0:  # Skip empty episodes
-            continue
+    tickers = list(top_stocks.keys())
+    shares = list(top_stocks.values())
 
-        episode_data = {
-            "Episode": episode_num,
-            "Open": portfolio_values[0],  # First value of the episode
-            "High": max(portfolio_values),  # Maximum portfolio value
-            "Low": min(portfolio_values),  # Minimum portfolio value
-            "Close": portfolio_values[-1],  # Last value of the episode
-        }
-        episodes.append(episode_data)
-
-    return pd.DataFrame(episodes)
-
-
-def plot_candlestick(df):
-    """
-    Plots a candlestick chart for episode-wise portfolio data.
-    Assumes df contains columns: ['Episode', 'Open', 'High', 'Low', 'Close']
-    """
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=df["Episode"],
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-            )
-        ]
+    # Bar Chart (Log Scale for better visibility)
+    bar_fig = px.bar(
+        x=tickers, 
+        y=shares, 
+        text=shares,
+        labels={"x": "Stock Ticker", "y": "Number of Shares"},
+        title="Stock Holdings Distribution (Top N + Others)",
+        color=shares,
+        color_continuous_scale="Blues"
     )
+    bar_fig.update_traces(textposition='outside')
+    bar_fig.update_layout(yaxis_type="log")  # Apply log scale
 
-    fig.update_layout(
-        title="Portfolio Value Candlestick Chart",
-        xaxis_title="Episode",
-        yaxis_title="Portfolio Value",
-        xaxis_rangeslider_visible=False,
+    # Pie Chart
+    pie_fig = go.Figure(
+        data=[go.Pie(
+            labels=tickers, 
+            values=shares, 
+            textinfo="percent+label", 
+            marker=dict(colors=px.colors.qualitative.Plotly)
+        )]
     )
+    pie_fig.update_layout(title_text="Stock Holdings Distribution (Top N + Others)")
 
-    fig.show()
+    # Show figures
+    bar_fig.show()
+    pie_fig.show()
 
-
-df_candlestick = generate_episode_candlestick_data(data)
-plot_candlestick(df_candlestick)
+for key, val in data2.items():
+    plot_holdings_distribution(val)

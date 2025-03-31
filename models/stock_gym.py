@@ -184,24 +184,37 @@ class StockTradeEnv(gym.Env):
             investment_fraction = base_fraction
 
         investable_amount = self.balance * investment_fraction
+        total_portfolio_value = self.portfolio_value()
 
-        if action == 1 and self.balance >= price:
-            num_shares = investable_amount // price
-            if num_shares > 0:
-                self.holdings[ticker] += num_shares
-                self.balance -= num_shares * price
+        # Sanity Checks
+        position_limit = 0.2 * total_portfolio_value  # No single stock should exceed 20% of portfolio
+        max_trade_volume = 0.1 * total_portfolio_value / price  # At most 10% of portfolio in one trade
+        min_trade_size = 1  # Minimum of 1 share per trade
+
+        if action == 1 and self.balance >= price:  # Buy
+            num_shares = min(investable_amount // price, max_trade_volume)
+            if num_shares < min_trade_size:
+                print(f"Skipped buying {ticker}, trade size too small.")
+                return
+
+            new_position_value = (self.holdings[ticker] + num_shares) * price
+            if new_position_value > position_limit:
+                print(f"Skipped buying {ticker}, would exceed 20% position limit.")
+                return
+
+            self.holdings[ticker] += num_shares
+            self.balance -= num_shares * price
             print(f"Bought {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f})")
 
-        elif action == 2 and self.holdings[ticker] > 0:
-            num_shares = min(
-                self.holdings[ticker], max(1, int(self.holdings[ticker] * 0.5))
-            )
-            if num_shares > 0:
-                self.balance += num_shares * price
-                self.holdings[ticker] -= num_shares
-            print(
-                f"Sold {num_shares} shares of {ticker[:-4]} at {price} (VIX: {vix:.2f})"
-            )
+        elif action == 2 and self.holdings[ticker] > 0:  # Sell
+            num_shares = min(self.holdings[ticker], max(1, int(self.holdings[ticker] * 0.5)))
+            if num_shares < min_trade_size:
+                print(f"Skipped selling {ticker}, trade size too small.")
+                return
+
+            self.balance += num_shares * price
+            self.holdings[ticker] -= num_shares
+            print(f"Sold {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f})")
 
     def portfolio_value(self):
         stock_value = 0
