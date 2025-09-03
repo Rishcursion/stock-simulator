@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 from collections import defaultdict
 
 import gymnasium as gym
@@ -6,24 +8,66 @@ import gymnasium.spaces as spaces
 import numpy as np
 import pandas as pd
 from pandas import DataFrame
-from scipy.stats import linregress
 
 
 def merge_stocks() -> DataFrame:
-    data = {}
-    for root, _, files in os.walk("data/merged"):
-        for file in files:
-            df: DataFrame = pd.read_csv(os.path.join(root, file))
+    """Load and merge stock data with improved error handling and logging"""
+    logger = logging.getLogger(__name__)
+    start_time = time.time()
 
-            # Ensure Date column is in datetime format
+    data = {}
+    data_path = os.path.join("data", "merged")
+
+    if not os.path.exists(data_path):
+        error_msg = f"Data directory not found at: {os.path.abspath(data_path)}"
+        logger.error(error_msg)
+        raise FileNotFoundError(error_msg)
+
+    logger.info(f"Loading stock data from {data_path}")
+
+    csv_files = [f for f in os.listdir(data_path) if f.endswith(".csv")]
+    logger.info(f"Found {len(csv_files)} CSV files to process")
+
+    for file in csv_files:
+        try:
+            file_path = os.path.join(data_path, file)
+            df: DataFrame = pd.read_csv(file_path)
+
+            # Optimize date parsing
             df["Date"] = pd.to_datetime(df["Date"], format="%d-%m-%Y", errors="coerce")
 
-            # Drop any rows where Date is missing or before 2000
-            df = df[df["Date"] >= "2000-01-01"]
+            # Filter data from 2000 onwards and remove invalid dates
+            initial_rows = len(df)
+            df = df[df["Date"] >= "2000-01-01"].dropna(subset=["Date"])
+            filtered_rows = len(df)
 
-            data[os.path.basename(file)] = df
+            ticker_name = file.replace(".csv", "")
+            data[ticker_name] = df
 
-    final_data = pd.concat(data, names=["Ticker", "Index"])
+            logger.debug(
+                f"Loaded {ticker_name}: {initial_rows} -> {filtered_rows} rows after filtering"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to process file {file}: {e}")
+            continue
+
+    if not data:
+        error_msg = "No data loaded. Check the 'data/merged' directory."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    # Optimize concatenation
+    logger.info("Concatenating data from all tickers...")
+    final_data = pd.concat(
+        data.values(), keys=data.keys(), names=["Ticker", "OldIndex"]
+    )
+    final_data = final_data.reset_index(level="OldIndex", drop=True).reset_index()
+
+    load_time = time.time() - start_time
+    logger.info(f"Data loading completed in {load_time:.2f}s")
+    logger.info(f"Total records: {len(final_data)}, Tickers: {len(data)}")
+
     return final_data
 
 
@@ -32,304 +76,566 @@ class StockTradeEnv(gym.Env):
         self,
         data,
         initial_cash: float = 50000,
-        num_stocks: int = 300,
-        liquidity: float = 0.75,
+        num_stocks: int = 50,
+        train_test_split_date: str = "2019-01-01",
+        mode: str = "train",
+        episode_length: int = 252,
+        log_level: str = "INFO",
     ) -> None:
         super(StockTradeEnv, self).__init__()
+
+        # Setup logging for this environment instance
+        self.logger = self._setup_logging(log_level)
+        self.logger.info("=" * 50)
+        self.logger.info("Initializing StockTradeEnv")
+        self.logger.info("=" * 50)
+
+        # Core parameters
         self.initial_cash = initial_cash
-        self.liquidity = liquidity
-        self.available_stocks = data
-        self.curr_iter = 0
+        self.num_stocks = num_stocks
+        self.episode_length = episode_length
+
+        # Log initialization parameters
+        self.logger.info("Initial parameters:")
+        self.logger.info(f"  Initial cash: ${initial_cash:,}")
+        self.logger.info(f"  Number of stocks: {num_stocks}")
+        self.logger.info(f"  Episode length: {episode_length} days")
+        self.logger.info(f"  Train/test split: {train_test_split_date}")
+
+        # Data processing with timing
+        start_time = time.time()
+        self.all_data = data.sort_values(by="Date").reset_index(drop=True)
+        data_process_time = time.time() - start_time
+        self.logger.info(f"Data sorting completed in {data_process_time:.3f}s")
+
+        # Data splitting logic with optimization
+        self.train_test_split_date = pd.to_datetime(train_test_split_date)
+
+        # Use vectorized operations for better performance
+        date_mask = self.all_data["Date"] < self.train_test_split_date
+        self.train_data = self.all_data[date_mask]
+        self.test_data = self.all_data[~date_mask]
+
+        # Pre-compute unique dates for better performance
+        self.train_dates = np.sort(self.train_data["Date"].unique())
+        self.test_dates = np.sort(self.test_data["Date"].unique())
+
+        # Log data split statistics
+        self.logger.info("Data split statistics:")
+        self.logger.info(
+            f"  Training data: {len(self.train_data)} records, {len(self.train_dates)} dates"
+        )
+        self.logger.info(
+            f"  Training period: {pd.to_datetime(self.train_dates[0]).to_pydatetime().date()} "
+            f"to {pd.to_datetime(self.train_dates[-1]).to_pydatetime().date()}"
+        )
+        self.logger.info(
+            f"  Test data: {len(self.test_data)} records, {len(self.test_dates)} dates"
+        )
+        self.logger.info(
+            f"  Test period: {pd.to_datetime(self.test_dates[0]).to_pydatetime().date()} "
+            f"to {pd.to_datetime(self.test_dates[-1]).to_pydatetime().date()}"
+        )
+
+        # Environment mode
+        self.mode = mode
+        self.current_dates = (
+            self.train_dates if self.mode == "train" else self.test_dates
+        )
+
+        # State variables
         self.balance = initial_cash
         self.holdings = defaultdict(int)
         self.portfolio_values = []
-        self.action_history = []
-        self.excess_returns = []
-        self.sharpe_ratios = []
-        self.treynor_ratios = []
-        self.market_returns = []
-        self.risk_free_rate = 0.10
-        self.num_stocks = num_stocks
+        self.portfolio_returns = []
+        self.episode_data = pd.DataFrame()
+        self.episode_observations = None
+        self.current_step = 0
+        self.prev_value = self.balance
 
-        self.selected_tickers = np.random.choice(
-            self.available_stocks.index.get_level_values(0).unique(),
-            size=self.num_stocks,
-            replace=False,
+        # Performance optimization: pre-compute ticker lists
+        self.train_tickers = self.train_data["Ticker"].unique()
+        self.test_tickers = self.test_data["Ticker"].unique()
+
+        self.logger.info(
+            f"Available tickers - Train: {len(self.train_tickers)}, Test: {len(self.test_tickers)}"
         )
 
-        self.prev_value = self.balance
+        self.selected_tickers = self._sample_tickers()
+        # Action and observation spaces
         self.action_space = spaces.Discrete(self.num_stocks * 3)  # 3 actions per stock
         self.observation_space = spaces.Box(
-            low=-float("inf"),
-            high=float("inf"),
-            shape=(6 * self.num_stocks,),
+            low=-np.inf,
+            high=np.inf,
+            shape=(6 * self.num_stocks,),  # 6 features per stock
             dtype=np.float32,
         )
 
-        print("Gymnasium Environment Initialized!")
+        # Episode tracking
+        self.episode_count = 0
+        self.total_episodes = 0
+        self.episode_start_time = None
+
+        self.logger.info(f"Environment initialized in '{self.mode}' mode!")
+        self.logger.info(f"Action space: {self.action_space.n} actions")
+        self.logger.info(f"Observation space: {self.observation_space.shape}")
+
+    def _setup_logging(self, log_level: str):
+        """Setup logging for the environment"""
+        logger = logging.getLogger(f"{__name__}.StockTradeEnv")
+
+        # Don't add handlers if they already exist
+        if not logger.handlers:
+            # Create console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(getattr(logging, log_level.upper()))
+
+            # Create formatter
+            formatter = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            )
+            console_handler.setFormatter(formatter)
+
+            # Add handler to logger
+            logger.addHandler(console_handler)
+            logger.setLevel(getattr(logging, log_level.upper()))
+
+        return logger
+
+    def set_mode(self, mode: str):
+        """Switch between train and test modes with logging"""
+        if mode not in ["train", "test"]:
+            error_msg = "Mode must be either 'train' or 'test'"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        old_mode = self.mode
+        self.mode = mode
+        self.current_dates = (
+            self.train_dates if self.mode == "train" else self.test_dates
+        )
+
+        self.logger.info(
+            f"Environment mode switched from '{old_mode}' to '{self.mode}'"
+        )
+        self.logger.info(
+            f"Available dates in {self.mode} mode: {len(self.current_dates)}"
+        )
+
+    def _sample_tickers(self):
+        """Sample tickers with performance optimization and logging"""
+        start_time = time.time()
+
+        # Use pre-computed ticker lists for better performance
+        available_tickers = (
+            self.train_tickers if self.mode == "train" else self.test_tickers
+        )
+
+        if len(available_tickers) < self.num_stocks:
+            self.logger.warning(
+                f"Only {len(available_tickers)} tickers available, requested {self.num_stocks}"
+            )
+            selected_tickers = available_tickers
+        else:
+            selected_tickers = np.random.choice(
+                available_tickers, size=self.num_stocks, replace=False
+            )
+
+        sample_time = time.time() - start_time
+        self.logger.debug(f"Ticker sampling completed in {sample_time:.4f}s")
+
+        return selected_tickers
 
     def reset(self, seed=None, options=None):
+        """Reset environment with comprehensive logging and optimization"""
         super().reset(seed=seed)
 
-        self.curr_iter = 0
+        self.episode_count += 1
+        self.total_episodes += 1
+        self.episode_start_time = time.time()
+
+        self.logger.info(f"Starting episode {self.episode_count} in {self.mode} mode")
+
+        # Optimized episode data selection
+        start_time = time.time()
+
+        max_start_index = len(self.current_dates) - self.episode_length - 1
+        if max_start_index <= 0:
+            self.logger.warning(
+                f"Not enough dates for episode length {self.episode_length}"
+            )
+            max_start_index = 0
+
+        start_date_index = np.random.randint(0, max(1, max_start_index))
+        start_date = self.current_dates[start_date_index]
+        end_date_index = min(
+            start_date_index + self.episode_length, len(self.current_dates) - 1
+        )
+        end_date = self.current_dates[end_date_index]
+
+        self.selected_tickers = self._sample_tickers()
+
+        # Optimized data filtering using boolean indexing
+        date_mask = (self.all_data["Date"] >= start_date) & (
+            self.all_data["Date"] <= end_date
+        )
+        ticker_mask = self.all_data["Ticker"].isin(self.selected_tickers)
+        self.episode_data = self.all_data[date_mask & ticker_mask].copy()
+
+        data_filter_time = time.time() - start_time
+
+        self.logger.info(f"Episode data prepared in {data_filter_time:.3f}s")
+        self.logger.info(
+            f"Episode period: {pd.to_datetime(start_date).to_pydatetime().date()} to {pd.to_datetime(end_date).to_pydatetime().date()}"
+        )
+        self.logger.info(f"Episode data shape: {self.episode_data.shape}")
+        self.logger.debug(f"Selected tickers: {list(self.selected_tickers)}")
+
+        # Pre-compute observations with error handling
+        try:
+            self._precompute_observations()
+        except Exception as e:
+            self.logger.error(f"Failed to precompute observations: {e}")
+            raise
+
+        # Reset state variables
+        self.current_step = 0
         self.balance = self.initial_cash
         self.holdings = defaultdict(int)
+        self.portfolio_values = [self.initial_cash]
         self.portfolio_returns = []
-        self.market_returns = []
-        self.portfolio_values = []
         self.prev_value = self.balance
-        self.selected_tickers = np.random.choice(
-            self.available_stocks.index.get_level_values(0).unique(),
-            size=self.num_stocks,
-            replace=False,
-        )
+
+        self.logger.debug(f"Episode {self.episode_count} reset completed")
 
         return self._get_observations(), {}
 
-    def step(self, action):
-        stock_index = action // 3  # Select which stock to act on
-        trade_action = action % 3  # 0 = Hold, 1 = Buy, 2 = Sell
+    def _precompute_observations(self):
+        """Pre-compute observations with optimization and error handling"""
+        start_time = time.time()
 
-        # Ensure stock_index is within bounds
-        if stock_index >= len(self.selected_tickers):
-            print(
-                f"Warning: stock_index {stock_index} is out of bounds. Defaulting to 0."
+        episode_dates = np.sort(self.episode_data["Date"].unique())
+        max_len = len(episode_dates)
+        if self.episode_length > max_len:
+            self.logger.warning(
+                f"Requested episode_length {self.episode_length} is greater than available dates {max_len}, using {max_len} instead"
             )
-            stock_index = 0  # Default to first stock
+        self.episode_length = min(self.episode_length, max_len)
+        episode_dates = episode_dates[
+            : self.episode_length
+        ]  # Crop to actual episode_length
+        self.episode_length = min(self.episode_length, len(episode_dates))
+
+        # Pre-allocate array for better performance
+        obs_array = np.zeros(
+            (self.episode_length, 6 * self.num_stocks), dtype=np.float32
+        )
+
+        # Create a pivot table for faster lookups
+        try:
+            pivot_data = self.episode_data.pivot_table(
+                index="Date",
+                columns="Ticker",
+                values=[
+                    "Stock_Return",
+                    "Market_Return",
+                    "Beta",
+                    "Treynor_Ratio",
+                    "S&P 500 Index",
+                    "VIX (Volatility Index)",
+                ],
+                aggfunc="first",
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"Pivot table creation failed, using slower method: {e}"
+            )
+            # Fallback to original method
+            self._precompute_observations_fallback()
+            return
+
+        # Fill observations efficiently
+        for i, current_date in enumerate(episode_dates):
+            obs_idx = 0
+            for ticker in self.selected_tickers:
+                try:
+                    # Extract data from pivot table
+                    stock_return = (
+                        pivot_data.loc[current_date, ("Stock_Return", ticker)]
+                        if ("Stock_Return", ticker) in pivot_data.columns
+                        else 0
+                    )
+                    market_return = (
+                        pivot_data.loc[current_date, ("Market_Return", ticker)]
+                        if ("Market_Return", ticker) in pivot_data.columns
+                        else 0
+                    )
+                    beta = (
+                        pivot_data.loc[current_date, ("Beta", ticker)]
+                        if ("Beta", ticker) in pivot_data.columns
+                        else 1
+                    )
+                    treynor = (
+                        pivot_data.loc[current_date, ("Treynor_Ratio", ticker)]
+                        if ("Treynor_Ratio", ticker) in pivot_data.columns
+                        else 0
+                    )
+                    sp500 = (
+                        pivot_data.loc[current_date, ("S&P 500 Index", ticker)]
+                        if ("S&P 500 Index", ticker) in pivot_data.columns
+                        else 0
+                    )
+                    vix = (
+                        pivot_data.loc[current_date, ("VIX (Volatility Index)", ticker)]
+                        if ("VIX (Volatility Index)", ticker) in pivot_data.columns
+                        else 20
+                    )
+
+                    obs_array[i, obs_idx : obs_idx + 6] = [
+                        stock_return,
+                        market_return,
+                        beta,
+                        treynor,
+                        sp500,
+                        vix,
+                    ]
+                except (KeyError, IndexError):
+                    # Use default values if data is missing
+                    obs_array[i, obs_idx : obs_idx + 6] = [0, 0, 1, 0, 0, 20]
+
+                obs_idx += 6
+
+        self.episode_observations = obs_array
+
+        precompute_time = time.time() - start_time
+        self.logger.debug(f"Observations precomputed in {precompute_time:.3f}s")
+        self.logger.debug(f"Observation shape: {self.episode_observations.shape}")
+
+    def _precompute_observations_fallback(self):
+        """Fallback method for precomputing observations"""
+        obs_list = []
+        episode_dates = self.episode_data["Date"].unique()
+        self.episode_length = min(self.episode_length, len(episode_dates))
+
+        for i in range(self.episode_length):
+            current_date = episode_dates[i]
+            obs_step = []
+
+            for ticker in self.selected_tickers:
+                row = self.episode_data[
+                    (self.episode_data["Date"] == current_date)
+                    & (self.episode_data["Ticker"] == ticker)
+                ]
+
+                if not row.empty:
+                    row = row.iloc[0]
+                    obs_step.extend(
+                        [
+                            row.get("Stock_Return", 0),
+                            row.get("Market_Return", 0),
+                            row.get("Beta", 1),
+                            row.get("Treynor_Ratio", 0),
+                            row.get("S&P 500 Index", 0),
+                            row.get("VIX (Volatility Index)", 20),
+                        ]
+                    )
+                else:
+                    obs_step.extend([0, 0, 1, 0, 0, 20])
+
+            obs_list.append(obs_step)
+
+        self.episode_observations = np.array(obs_list, dtype=np.float32)
+
+    def _get_observations(self):
+        """Get current observations with bounds checking"""
+        step_index = min(self.current_step, self.episode_observations.shape[0] - 1)
+        obs = self.episode_observations[step_index]
+
+        # Handle NaN values
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        return obs
+
+    def step(self, action):
+        """Execute one step with comprehensive logging and optimization"""
+        step_start_time = time.time()
+
+        # Action decomposition
+        stock_index = action // 3
+        trade_action = action % 3
+
+        if stock_index >= len(self.selected_tickers):
+            self.logger.warning(
+                f"Invalid stock index {stock_index}, max is {len(self.selected_tickers)-1}"
+            )
+            stock_index = stock_index % len(self.selected_tickers)
 
         ticker = self.selected_tickers[stock_index]
 
-        # Ensure ticker exists in available_stocks
-        if ticker not in self.available_stocks.index:
-            print(f"Warning: {ticker} not found in available_stocks. Skipping.")
-            return self._get_observations(), 0, True, {}
+        # Get current date with bounds checking
+        episode_dates = np.sort(self.episode_data["Date"].unique())
+        if self.current_step >= len(episode_dates):
+            self.logger.warning(
+                f"Step {self.current_step} exceeds available dates {len(episode_dates)}"
+            )
+            self.current_step = len(episode_dates) - 1
 
-        # Ensure curr_iter is within bounds
-        if self.curr_iter >= len(self.available_stocks.loc[ticker]) - 1:
-            print(f"Warning: curr_iter {self.curr_iter} out of bounds. Ending episode.")
-            return self._get_observations(), 0, True, {}
+        current_date = episode_dates[self.current_step]
 
-        self.execute_trade(trade_action, stock_index)
+        # Execute trade with logging
+        old_balance = self.balance
+        old_holdings = dict(self.holdings)
 
-        new_value = self.portfolio_value()
-        if new_value is None:
-            print("Warning: portfolio_value() returned None. Setting reward to 0.")
-            return self._get_observations(), 0, True, {}
-        portfolio_return = (new_value - self.prev_value) / (self.prev_value + 1e-6)
+        self.execute_trade(trade_action, ticker, current_date)
+
+        # Calculate portfolio value and returns
+        new_value = self.portfolio_value(current_date)
+        portfolio_return = (new_value - self.prev_value) / (self.prev_value + 1e-9)
+
+        # Log trade details if significant change occurred
+        if abs(self.balance - old_balance) > 0.01 or self.holdings.get(
+            ticker, 0
+        ) != old_holdings.get(ticker, 0):
+            action_names = ["HOLD", "BUY", "SELL"]
+            self.logger.debug(
+                f"Step {self.current_step}: {action_names[trade_action]} {ticker} | "
+                f"Balance: ${old_balance:.2f} -> ${self.balance:.2f} | "
+                f"Holdings[{ticker}]: {old_holdings.get(ticker, 'None')} -> {self.holdings[ticker]} | "
+                f"Portfolio: ${self.prev_value:.2f} -> ${new_value:.2f}"
+            )
+
+        # Update state
+        self.portfolio_returns.append(portfolio_return)
         self.prev_value = new_value
-
         self.portfolio_values.append(new_value)
-        self.action_history.append(action)
 
-        # Ensure S&P 500 Index data exists and is within bounds
-        try:
-            market_return = (
-                self.available_stocks.loc[ticker].iloc[self.curr_iter + 1][
-                    "S&P 500 Index"
-                ]
-                - self.available_stocks.loc[ticker].iloc[self.curr_iter][
-                    "S&P 500 Index"
-                ]
-            ) / (
-                self.available_stocks.loc[ticker].iloc[self.curr_iter]["S&P 500 Index"]
-                + 1e-6
-            )
-        except (IndexError, KeyError):
-            print(
-                f"Warning: Missing S&P 500 Index data for {ticker}. Setting market_return to 0."
-            )
-            market_return = 0
+        # Calculate reward (scaled for better training)
+        reward = portfolio_return * 100
+        reward = np.clip(reward, -10, 10)  # Prevent extreme rewards
 
-        self.market_returns.append(market_return)
+        # Update step
+        self.current_step += 1
+        done = self.current_step >= self.episode_length
 
-        # Compute Beta
-        if len(self.portfolio_returns) > 1 and len(self.market_returns) > 1:
-            beta = self.compute_beta(self.portfolio_returns, self.market_returns)
-        else:
-            beta = 1  # Default beta
-
-        alpha = portfolio_return - (
-            self.risk_free_rate + beta * (market_return - self.risk_free_rate)
-        )
-
-        excess_return = portfolio_return - self.risk_free_rate
-        self.excess_returns.append(excess_return)
-
-        # Compute Sharpe Ratio safely
-        if len(self.portfolio_returns) > 30:
-            std_dev = np.std(self.portfolio_returns[-30:])
-        else:
-            std_dev = np.std(self.portfolio_returns) if self.portfolio_returns else 1e-6
-
-        sharpe_ratio = excess_return / (std_dev + 1e-6)
-        sharpe_ratio = sharpe_ratio if np.isfinite(sharpe_ratio) else 0
-        self.sharpe_ratios.append(sharpe_ratio)
-
-        treynor_ratio = excess_return / (beta + 1e-6)
-        treynor_ratio = treynor_ratio if np.isfinite(treynor_ratio) else 0
-        self.treynor_ratios.append(treynor_ratio)
-
-        reward = (sharpe_ratio * 0.6) + (treynor_ratio * 0.2) + (alpha * 0.2)
-        reward = reward if np.isfinite(reward) else 0
-
-        self.curr_iter += 1
-        done = self.curr_iter >= len(self.available_stocks.loc[ticker]) - 1
+        # Episode completion logging
         if done:
-            print(f"Best Portfolio: {max(self.portfolio_values)}")
-        print("=" * 40)
-        print(f"\nStep: {self.curr_iter}")
-        print(f"Balance: {self.balance}")
-        print(f"Current Portfolio Value: {self.portfolio_value()}")
-        print(f"Action Taken: {['Hold', 'Buy', 'Sell'][trade_action]} on {ticker}")
-        print("=" * 40)
+            episode_time = time.time() - self.episode_start_time
+            final_return = (new_value - self.initial_cash) / self.initial_cash
+
+            self.logger.info(
+                f"Episode {self.episode_count} completed in {episode_time:.2f}s"
+            )
+            self.logger.info(f"Final portfolio value: ${new_value:.2f}")
+            self.logger.info(f"Total return: {final_return:.2%}")
+
+            if len(self.portfolio_returns) > 1:
+                sharpe_ratio = np.mean(self.portfolio_returns) / (
+                    np.std(self.portfolio_returns) + 1e-9
+                )
+                self.logger.info(f"Sharpe ratio: {sharpe_ratio:.4f}")
+
+            # Log holdings summary
+            total_stock_value = sum(
+                self.holdings[ticker] * self._get_current_price(ticker, current_date)
+                for ticker in self.holdings
+                if self.holdings[ticker] > 0
+            )
+            self.logger.info(
+                f"Final allocation - Cash: ${self.balance:.2f}, Stocks: ${total_stock_value:.2f}"
+            )
+
+        step_time = time.time() - step_start_time
+        if step_time > 0.001:  # Log only if step took significant time
+            self.logger.debug(
+                f"Step {self.current_step-1} completed in {step_time:.4f}s"
+            )
 
         return self._get_observations(), reward, done, {}
 
-    def execute_trade(self, action, stock_index):
-        ticker = self.selected_tickers[stock_index]
-        max_idx = len(self.available_stocks.loc[ticker]) - 1
-        self.curr_iter = min(self.curr_iter, max_idx)
-        row = self.available_stocks.loc[ticker].iloc[self.curr_iter]
-        price = row["Close"]
-        vix = row.get("VIX (Volatility Index)", 20)
-        volume = row.get("Volume", 1e6)  # Default to high liquidity if missing
-
-        # Adaptive investment percentage based on VIX
-        base_fraction = 0.10  # Default 10% of balance
-        if vix > 25:  # High volatility, invest only 5%
-            investment_fraction = 0.05
-        elif vix < 15:  # Low volatility, invest 15%
-            investment_fraction = 0.15
-        else:  # Medium volatility, default to 10%
-            investment_fraction = base_fraction
-
-        investable_amount = self.balance * investment_fraction
-        total_portfolio_value = self.portfolio_value()
-
-        # Sanity Checks
-        position_limit = (
-            0.2 * total_portfolio_value
-        )  # No single stock should exceed 20% of portfolio
-        max_trade_volume = (
-            0.1 * total_portfolio_value / price
-        )  # At most 10% of portfolio in one trade
-        min_trade_size = 1  # Minimum of 1 share per trade
-        max_liquid_shares = (
-            volume * self.liquidity
-        )  # Max shares tradable based on liquidity
-
-        if action == 1 and self.balance >= price:  # Buy
-            num_shares = min(
-                investable_amount // price, max_trade_volume, max_liquid_shares
-            )
-            if num_shares < min_trade_size:
-                print(f"Skipped buying {ticker}, trade size too small or illiquid.")
+    def execute_trade(self, action, ticker, current_date):
+        """Execute trade with improved error handling and logging"""
+        try:
+            price = self._get_current_price(ticker, current_date)
+            if price is None:
                 return
 
-            new_position_value = (self.holdings[ticker] + num_shares) * price
-            if new_position_value > position_limit:
-                print(f"Skipped buying {ticker}, would exceed 20% position limit.")
-                return
+            if action == 1:  # BUY
+                if self.balance >= price:
+                    # Buy 10% of available balance
+                    max_shares = int((self.balance * 0.1) // price)
+                    if max_shares > 0:
+                        cost = max_shares * price
+                        self.holdings[ticker] += max_shares
+                        self.balance -= cost
 
-            self.holdings[ticker] += num_shares
-            self.balance -= num_shares * price
-            print(
-                f"Bought {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f}, Liquidity: {self.liquidity})"
+            elif action == 2:  # SELL
+                if self.holdings[ticker] > 0:
+                    # Sell all holdings of this ticker
+                    num_shares = self.holdings[ticker]
+                    revenue = num_shares * price
+                    self.balance += revenue
+                    self.holdings[ticker] = 0
+
+        except Exception as e:
+            self.logger.error(
+                f"Trade execution failed for {ticker} on {current_date}: {e}"
             )
 
-        elif action == 2 and self.holdings[ticker] > 0:  # Sell
-            num_shares = min(
-                self.holdings[ticker],
-                max(1, int(self.holdings[ticker] * 0.5)),
-                max_liquid_shares,
-            )
-            if num_shares < min_trade_size:
-                print(f"Skipped selling {ticker}, trade size too small or illiquid.")
-                return
+    def _get_current_price(self, ticker, current_date):
+        """Get current price with caching and error handling"""
+        try:
+            row = self.episode_data[
+                (self.episode_data["Date"] == current_date)
+                & (self.episode_data["Ticker"] == ticker)
+            ]
 
-            self.balance += num_shares * price
-            self.holdings[ticker] -= num_shares
-            print(
-                f"Sold {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f}, Liquidity: {self.liquidity})"
-            )
+            if row.empty:
+                self.logger.debug(f"No price data for {ticker} on {current_date}")
+                return None
 
-    def portfolio_value(self):
+            return row.iloc[0]["Close"]
+
+        except (IndexError, KeyError) as e:
+            self.logger.debug(
+                f"Price lookup failed for {ticker} on {current_date}: {e}"
+            )
+            return None
+
+    def portfolio_value(self, current_date):
+        """Calculate portfolio value with optimization and error handling"""
         stock_value = 0
-        for ticker in self.holdings:
-            if ticker not in self.available_stocks.index:
-                print(f"Warning: {ticker} not found in available_stocks. Skipping.")
-                continue  # Skip missing tickers
 
-            stock_data = self.available_stocks.loc[ticker]
+        for ticker, shares in self.holdings.items():
+            if shares > 0:
+                price = self._get_current_price(ticker, current_date)
+                if price is not None:
+                    stock_value += shares * price
 
-            if self.curr_iter >= len(stock_data):  # Prevent out-of-bounds error
-                print(
-                    f"Warning: Index {self.curr_iter} out of bounds for {ticker}. Skipping."
-                )
-                continue
+        total_value = self.balance + stock_value
 
-            stock_price = stock_data.iloc[self.curr_iter].get(
-                "Close", None
-            )  # Use "Close" (case-sensitive)
-            if stock_price is None:
-                print(
-                    f"Warning: 'Close' price missing for {ticker} at step {self.curr_iter}. Skipping."
-                )
-                continue
-
-            stock_value += self.holdings[ticker] * stock_price
-
-        return (
-            self.balance + stock_value
-        )  # ✅ Return **after** looping through all stocks
-
-    def _get_observations(self):
-        obs = []
-        for ticker in self.selected_tickers:
-            if ticker not in self.available_stocks.index:
-                print(f"Warning: {ticker} not found in available_stocks. Skipping.")
-                obs.extend([np.nan] * 6)  # Fill with NaNs for later interpolation
-                continue
-
-            stock_data = self.available_stocks.loc[ticker]
-
-            if self.curr_iter >= len(stock_data):  # ✅ Check index bounds
-                print(
-                    f"Warning: Index {self.curr_iter} out of bounds for {ticker}. Skipping."
-                )
-                obs.extend([np.nan] * 6)  # Fill with NaNs for later interpolation
-                continue
-
-            row = stock_data.iloc[self.curr_iter]
-
-            obs.extend(
-                [
-                    row.get("Stock_Return", np.nan),
-                    row.get("Market_Return", np.nan),
-                    row.get("Beta", np.nan),
-                    row.get("Treynor_Ratio", np.nan),
-                    row.get("S&P 500 Index", np.nan),
-                    row.get("VIX (Volatility Index)", np.nan),
-                ]
+        # Sanity check
+        if total_value < 0:
+            self.logger.warning(
+                f"Negative portfolio value detected: ${total_value:.2f}"
             )
 
-        # Convert to NumPy array and interpolate missing values
-        obs_array = np.array(obs, dtype=np.float32)
+        return total_value
 
-        # Apply interpolation (ignores NaNs)
-        obs_array = (
-            pd.Series(obs_array)
-            .interpolate(method="linear", limit_direction="both")
-            .to_numpy()
-        )
-
-        return obs_array
-
-    @staticmethod
-    def compute_beta(portfolio_returns, market_returns, window=30):
-        if len(portfolio_returns) < window:
-            return 1
-        slope, _, _, _, _ = linregress(
-            market_returns[-window:], portfolio_returns[-window:]
-        )
-        return slope if np.isfinite(slope) else 1
+    def get_env_stats(self):
+        """Get environment statistics for monitoring"""
+        return {
+            "mode": self.mode,
+            "episode_count": self.episode_count,
+            "total_episodes": self.total_episodes,
+            "current_step": self.current_step,
+            "episode_length": self.episode_length,
+            "num_selected_tickers": len(self.selected_tickers),
+            "episode_data_shape": (
+                self.episode_data.shape if not self.episode_data.empty else (0, 0)
+            ),
+            "current_portfolio_value": (
+                self.portfolio_values[-1]
+                if self.portfolio_values
+                else self.initial_cash
+            ),
+        }
