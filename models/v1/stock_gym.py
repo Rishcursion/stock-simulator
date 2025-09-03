@@ -11,7 +11,7 @@ from scipy.stats import linregress
 
 def merge_stocks() -> DataFrame:
     data = {}
-    for root, _, files in os.walk("../data/merged"):
+    for root, _, files in os.walk("data/merged"):
         for file in files:
             df: DataFrame = pd.read_csv(os.path.join(root, file))
 
@@ -29,10 +29,15 @@ def merge_stocks() -> DataFrame:
 
 class StockTradeEnv(gym.Env):
     def __init__(
-        self, data, initial_cash: float=50000, num_stocks: int = 300
+        self,
+        data,
+        initial_cash: float = 50000,
+        num_stocks: int = 300,
+        liquidity: float = 0.75,
     ) -> None:
         super(StockTradeEnv, self).__init__()
         self.initial_cash = initial_cash
+        self.liquidity = liquidity
         self.available_stocks = data
         self.curr_iter = 0
         self.balance = initial_cash
@@ -45,6 +50,7 @@ class StockTradeEnv(gym.Env):
         self.market_returns = []
         self.risk_free_rate = 0.10
         self.num_stocks = num_stocks
+
         self.selected_tickers = np.random.choice(
             self.available_stocks.index.get_level_values(0).unique(),
             size=self.num_stocks,
@@ -66,7 +72,7 @@ class StockTradeEnv(gym.Env):
         super().reset(seed=seed)
 
         self.curr_iter = 0
-        self.balance = self.initial_cash 
+        self.balance = self.initial_cash
         self.holdings = defaultdict(int)
         self.portfolio_returns = []
         self.market_returns = []
@@ -86,7 +92,9 @@ class StockTradeEnv(gym.Env):
 
         # Ensure stock_index is within bounds
         if stock_index >= len(self.selected_tickers):
-            print(f"Warning: stock_index {stock_index} is out of bounds. Defaulting to 0.")
+            print(
+                f"Warning: stock_index {stock_index} is out of bounds. Defaulting to 0."
+            )
             stock_index = 0  # Default to first stock
 
         ticker = self.selected_tickers[stock_index]
@@ -116,11 +124,20 @@ class StockTradeEnv(gym.Env):
         # Ensure S&P 500 Index data exists and is within bounds
         try:
             market_return = (
-                self.available_stocks.loc[ticker].iloc[self.curr_iter + 1]["S&P 500 Index"]
-                - self.available_stocks.loc[ticker].iloc[self.curr_iter]["S&P 500 Index"]
-            ) / (self.available_stocks.loc[ticker].iloc[self.curr_iter]["S&P 500 Index"] + 1e-6)
+                self.available_stocks.loc[ticker].iloc[self.curr_iter + 1][
+                    "S&P 500 Index"
+                ]
+                - self.available_stocks.loc[ticker].iloc[self.curr_iter][
+                    "S&P 500 Index"
+                ]
+            ) / (
+                self.available_stocks.loc[ticker].iloc[self.curr_iter]["S&P 500 Index"]
+                + 1e-6
+            )
         except (IndexError, KeyError):
-            print(f"Warning: Missing S&P 500 Index data for {ticker}. Setting market_return to 0.")
+            print(
+                f"Warning: Missing S&P 500 Index data for {ticker}. Setting market_return to 0."
+            )
             market_return = 0
 
         self.market_returns.append(market_return)
@@ -131,7 +148,9 @@ class StockTradeEnv(gym.Env):
         else:
             beta = 1  # Default beta
 
-        alpha = portfolio_return - (self.risk_free_rate + beta * (market_return - self.risk_free_rate))
+        alpha = portfolio_return - (
+            self.risk_free_rate + beta * (market_return - self.risk_free_rate)
+        )
 
         excess_return = portfolio_return - self.risk_free_rate
         self.excess_returns.append(excess_return)
@@ -150,7 +169,7 @@ class StockTradeEnv(gym.Env):
         treynor_ratio = treynor_ratio if np.isfinite(treynor_ratio) else 0
         self.treynor_ratios.append(treynor_ratio)
 
-        reward = (sharpe_ratio * 0.4) + (treynor_ratio * 0.3) + (alpha * 0.3)
+        reward = (sharpe_ratio * 0.6) + (treynor_ratio * 0.2) + (alpha * 0.2)
         reward = reward if np.isfinite(reward) else 0
 
         self.curr_iter += 1
@@ -173,6 +192,7 @@ class StockTradeEnv(gym.Env):
         row = self.available_stocks.loc[ticker].iloc[self.curr_iter]
         price = row["Close"]
         vix = row.get("VIX (Volatility Index)", 20)
+        volume = row.get("Volume", 1e6)  # Default to high liquidity if missing
 
         # Adaptive investment percentage based on VIX
         base_fraction = 0.10  # Default 10% of balance
@@ -187,14 +207,23 @@ class StockTradeEnv(gym.Env):
         total_portfolio_value = self.portfolio_value()
 
         # Sanity Checks
-        position_limit = 0.2 * total_portfolio_value  # No single stock should exceed 20% of portfolio
-        max_trade_volume = 0.1 * total_portfolio_value / price  # At most 10% of portfolio in one trade
+        position_limit = (
+            0.2 * total_portfolio_value
+        )  # No single stock should exceed 20% of portfolio
+        max_trade_volume = (
+            0.1 * total_portfolio_value / price
+        )  # At most 10% of portfolio in one trade
         min_trade_size = 1  # Minimum of 1 share per trade
+        max_liquid_shares = (
+            volume * self.liquidity
+        )  # Max shares tradable based on liquidity
 
         if action == 1 and self.balance >= price:  # Buy
-            num_shares = min(investable_amount // price, max_trade_volume)
+            num_shares = min(
+                investable_amount // price, max_trade_volume, max_liquid_shares
+            )
             if num_shares < min_trade_size:
-                print(f"Skipped buying {ticker}, trade size too small.")
+                print(f"Skipped buying {ticker}, trade size too small or illiquid.")
                 return
 
             new_position_value = (self.holdings[ticker] + num_shares) * price
@@ -204,17 +233,25 @@ class StockTradeEnv(gym.Env):
 
             self.holdings[ticker] += num_shares
             self.balance -= num_shares * price
-            print(f"Bought {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f})")
+            print(
+                f"Bought {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f}, Liquidity: {self.liquidity})"
+            )
 
         elif action == 2 and self.holdings[ticker] > 0:  # Sell
-            num_shares = min(self.holdings[ticker], max(1, int(self.holdings[ticker] * 0.5)))
+            num_shares = min(
+                self.holdings[ticker],
+                max(1, int(self.holdings[ticker] * 0.5)),
+                max_liquid_shares,
+            )
             if num_shares < min_trade_size:
-                print(f"Skipped selling {ticker}, trade size too small.")
+                print(f"Skipped selling {ticker}, trade size too small or illiquid.")
                 return
 
             self.balance += num_shares * price
             self.holdings[ticker] -= num_shares
-            print(f"Sold {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f})")
+            print(
+                f"Sold {num_shares} shares of {ticker} at {price} (VIX: {vix:.2f}, Liquidity: {self.liquidity})"
+            )
 
     def portfolio_value(self):
         stock_value = 0
@@ -226,17 +263,26 @@ class StockTradeEnv(gym.Env):
             stock_data = self.available_stocks.loc[ticker]
 
             if self.curr_iter >= len(stock_data):  # Prevent out-of-bounds error
-                print(f"Warning: Index {self.curr_iter} out of bounds for {ticker}. Skipping.")
+                print(
+                    f"Warning: Index {self.curr_iter} out of bounds for {ticker}. Skipping."
+                )
                 continue
 
-            stock_price = stock_data.iloc[self.curr_iter].get("Close", None)  # Use "Close" (case-sensitive)
+            stock_price = stock_data.iloc[self.curr_iter].get(
+                "Close", None
+            )  # Use "Close" (case-sensitive)
             if stock_price is None:
-                print(f"Warning: 'Close' price missing for {ticker} at step {self.curr_iter}. Skipping.")
+                print(
+                    f"Warning: 'Close' price missing for {ticker} at step {self.curr_iter}. Skipping."
+                )
                 continue
 
             stock_value += self.holdings[ticker] * stock_price
 
-        return self.balance + stock_value  # ✅ Return **after** looping through all stocks
+        return (
+            self.balance + stock_value
+        )  # ✅ Return **after** looping through all stocks
+
     def _get_observations(self):
         obs = []
         for ticker in self.selected_tickers:
@@ -248,7 +294,9 @@ class StockTradeEnv(gym.Env):
             stock_data = self.available_stocks.loc[ticker]
 
             if self.curr_iter >= len(stock_data):  # ✅ Check index bounds
-                print(f"Warning: Index {self.curr_iter} out of bounds for {ticker}. Skipping.")
+                print(
+                    f"Warning: Index {self.curr_iter} out of bounds for {ticker}. Skipping."
+                )
                 obs.extend([np.nan] * 6)  # Fill with NaNs for later interpolation
                 continue
 
@@ -267,9 +315,13 @@ class StockTradeEnv(gym.Env):
 
         # Convert to NumPy array and interpolate missing values
         obs_array = np.array(obs, dtype=np.float32)
-        
+
         # Apply interpolation (ignores NaNs)
-        obs_array = pd.Series(obs_array).interpolate(method="linear", limit_direction="both").to_numpy()
+        obs_array = (
+            pd.Series(obs_array)
+            .interpolate(method="linear", limit_direction="both")
+            .to_numpy()
+        )
 
         return obs_array
 

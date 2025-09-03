@@ -1,0 +1,34 @@
+================================================================================
+ABLATION STUDY SUMMARY
+================================================================================
+
+Experiment Configuration:
+  - Episodes: 40
+  - Stocks: 400
+  - Initial Cash: $50,000.00
+  - Random Seed: 8008135
+
+MINIMAL MODEL (Without Macros):
+  - Mean Portfolio Value: $79,573.70 ± $35,247.08
+  - Mean Return: 0.5915 ± 0.7049
+  - Sharpe Ratio: 0.8390
+  - Success Rate: 92.50%
+  - Best Portfolio: $195,265.01
+
+FULL MODEL (With Macros):
+  - Mean Portfolio Value: $85,936.21 ± $31,774.38
+  - Mean Return: 0.7187 ± 0.6355
+  - Sharpe Ratio: 1.1310
+  - Success Rate: 100.00%
+  - Best Portfolio: $197,946.15
+
+IMPROVEMENT WITH MACRO FEATURES:
+  - Portfolio Value: $6,362.50 (8.00%)
+  - Mean Return: 0.1273 (21.51%)
+  - Sharpe Ratio: 0.2919 (34.79%)
+  - Success Rate: 0.0750 (8.11%)
+
+STATISTICAL SIGNIFICANCE:
+  - T-test p-value: 0.4050 (Not Significant)
+  - Rewards T-test p-value: 0.9021 (Not Significant)
+  - Mann-Whitney U p-value: 0.0791 (Not Significant)
